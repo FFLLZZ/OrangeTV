@@ -1,17 +1,23 @@
+
 name: Build & Push Docker image
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Docker 标签'
-        required: false
-        default: 'latest'
-        type: string
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+  pull_request_target:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+    types:
+      - labeled
+      - synchronize
+
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,6 +27,7 @@ permissions:
   contents: write
   packages: write
   actions: write
+  pull-requests: write
 
 jobs:
   build:
@@ -58,11 +65,11 @@ jobs:
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
-
         with:
-          images: ghcr.io/moontechlab/lunatv
+          images: ghcr.io/${{ steps.lowercase.outputs.owner }}/orangetv
           tags: |
-            type=raw,value=${{ github.event.inputs.tag || 'latest' }},enable={{is_default_branch}}
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push by digest
         id: build
@@ -72,8 +79,7 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ghcr.io/moontechlab/lunatv:${{ github.event.inputs.tag || 'latest' }}
-          outputs: type=image,name=ghcr.io/moontechlab/lunatv,name-canonical=true,push=true
+          outputs: type=image,name=ghcr.io/${{ steps.lowercase.outputs.owner }}/orangetv,push-by-digest=true,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -115,17 +121,62 @@ jobs:
         id: lowercase
         run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.lowercase.outputs.owner }}/orangetv
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=raw,value=latest,enable={{is_default_branch}}
+
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          docker buildx imagetools create -t ghcr.io/moontechlab/lunatv:${{ github.event.inputs.tag || 'latest' }} \
-            $(printf 'ghcr.io/moontechlab/lunatv@sha256:%s ' *)
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ steps.lowercase.outputs.owner }}/orangetv@sha256:%s ' *)
 
-  cleanup-refresh:
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ghcr.io/${{ steps.lowercase.outputs.owner }}/orangetv:${{ steps.meta.outputs.version }}
+
+  pr-comment:
     runs-on: ubuntu-latest
     needs:
       - merge
-    if: always()
+    if: github.event_name == 'pull_request_target'
+    steps:
+      - name: Set lowercase repository owner
+        id: lowercase
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🎉 您的 PR 已构建完成！
+
+            Docker 镜像已成功构建并推送到 GitHub Container Registry。
+
+            **拉取命令：**
+            \`\`\`bash
+            docker pull ghcr.io/${{ steps.lowercase.outputs.owner }}/orangetv:pr-${{ github.event.number }}
+            \`\`\`
+
+            **标签：** \`pr-${{ github.event.number }}\`
+
+            构建完成时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
+            });
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs:
+      - merge
+    if: always() && github.event_name != 'pull_request_target'
     steps:
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@main
@@ -134,3 +185,16 @@ jobs:
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 2
+
+  version-cache-refresh:
+    runs-on: ubuntu-latest
+    needs:
+      - cleanup
+    if: always() && github.event_name != 'pull_request_target'
+    steps:
+      - name: Refresh VERSION.txt cache
+        run: |
+          echo "Refreshing VERSION.txt cache..."
+          curl -s https://purge.jsdelivr.net/gh/LunaTechLab/orangetv/VERSION.txt
+          echo ""
+          echo "VERSION.txt cache refreshed successfully"
